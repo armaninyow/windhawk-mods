@@ -70,18 +70,29 @@ DEFINE_GUID(IID_IServiceProvider_,
 #define EXPLORER_REFRESH_CMD_2 0x7103  // Context menu Refresh
 #define AUTOFIT_TIMER_ID       0xAF17
 
+// Window classes that receive refresh commands
+// ShellTabWindowClass : WM_COMMAND (Ctrl+R, F5, context menu)
+// ReBarWindow32       : WM_NOTIFY (toolbar button, via ToolbarWindow32 child)
+// ToolbarWindow32     : WM_NOTIFY (toolbar button)
+static const PCWSTR kSubclassTargets[] = {
+    L"ShellTabWindowClass",
+    L"ReBarWindow32",
+    L"ToolbarWindow32",
+};
+
+// ---------------------------------------------------------------------------
+// Thread safety: single CRITICAL_SECTION guards all global map access
+// ---------------------------------------------------------------------------
+
+static CRITICAL_SECTION g_cs;
+
 // ---------------------------------------------------------------------------
 // Map: ShellTabWindowClass HWND -> IShellView* (AddRef'd)
-// Updated every time UIActivate fires for that tab
+// Map: subclassed window HWND -> its ShellTabWindowClass HWND
 // ---------------------------------------------------------------------------
 
 static std::unordered_map<HWND, IShellView*> g_tabShellViews;
-
-// ---------------------------------------------------------------------------
-// Map: all subclassed windows
-// ---------------------------------------------------------------------------
-
-static std::unordered_map<HWND, HWND> g_windowToTab; // any hwnd -> its ShellTabWindowClass
+static std::unordered_map<HWND, HWND>        g_windowToTab;
 
 // ---------------------------------------------------------------------------
 // Auto-fit all visible columns to content
@@ -129,7 +140,6 @@ static void AutoFitColumns(IShellView* pShellView) {
 
 // ---------------------------------------------------------------------------
 // Find the ShellTabWindowClass ancestor of a HWND
-// Returns nullptr if not found (e.g. single-tab, use hwndTop instead)
 // ---------------------------------------------------------------------------
 
 static HWND FindTabWindow(HWND hwnd) {
@@ -142,6 +152,20 @@ static HWND FindTabWindow(HWND hwnd) {
         cur = GetParent(cur);
     }
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Check if a window class is one we want to subclass
+// ---------------------------------------------------------------------------
+
+static bool IsSubclassTarget(HWND hwnd) {
+    WCHAR cls[64] = {};
+    GetClassNameW(hwnd, cls, 64);
+    for (PCWSTR target : kSubclassTargets) {
+        if (wcscmp(cls, target) == 0)
+            return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -170,25 +194,38 @@ static LRESULT CALLBACK ExplorerSubclassProc(
     }
 
     if (isRefresh) {
-        // Find which tab this window belongs to
-        HWND hwndTab = g_windowToTab.count(hwnd) ? g_windowToTab[hwnd] : nullptr;
+        HWND hwndTab = nullptr;
+        {
+            EnterCriticalSection(&g_cs);
+            auto it = g_windowToTab.find(hwnd);
+            if (it != g_windowToTab.end())
+                hwndTab = it->second;
+            LeaveCriticalSection(&g_cs);
+        }
 
         UINT delay = static_cast<UINT>(Wh_GetIntSetting(L"delay"));
         if (delay == 0) delay = 400;
-
-        // Store tab HWND in timer ID's window so we know which tab to fit
-        // Use the tab window for the timer if available, else use hwnd
         HWND hwndTimer = hwndTab ? hwndTab : hwnd;
         SetTimer(hwndTimer, AUTOFIT_TIMER_ID, delay, nullptr);
     }
 
     if (uMsg == WM_TIMER && wParam == AUTOFIT_TIMER_ID) {
         KillTimer(hwnd, AUTOFIT_TIMER_ID);
-        // hwnd here is the tab window (ShellTabWindowClass) or fallback
-        auto it = g_tabShellViews.find(hwnd);
-        if (it != g_tabShellViews.end() && it->second) {
-            AutoFitColumns(it->second);
-        } else {
+
+        IShellView* pSV = nullptr;
+        {
+            EnterCriticalSection(&g_cs);
+            auto it = g_tabShellViews.find(hwnd);
+            if (it != g_tabShellViews.end() && it->second) {
+                pSV = it->second;
+                pSV->AddRef(); // keep alive outside the lock
+            }
+            LeaveCriticalSection(&g_cs);
+        }
+
+        if (pSV) {
+            AutoFitColumns(pSV);
+            pSV->Release();
         }
         return 0;
     }
@@ -196,39 +233,45 @@ static LRESULT CALLBACK ExplorerSubclassProc(
     if (uMsg == WM_NCDESTROY) {
         KillTimer(hwnd, AUTOFIT_TIMER_ID);
         WindhawkUtils::RemoveWindowSubclassFromAnyThread(hwnd, ExplorerSubclassProc);
+
+        EnterCriticalSection(&g_cs);
         g_windowToTab.erase(hwnd);
-        // If this was a tab window, release its shell view
         auto it = g_tabShellViews.find(hwnd);
         if (it != g_tabShellViews.end()) {
             if (it->second) it->second->Release();
             g_tabShellViews.erase(it);
         }
+        LeaveCriticalSection(&g_cs);
     }
 
     return DefSubclassProc(hwnd, uMsg, wParam, lParam);
 }
 
 // ---------------------------------------------------------------------------
-// Subclass helpers
+// Subclass a window if it's a target class, updating tab association
 // ---------------------------------------------------------------------------
 
-static void SubclassIfNew(HWND hwnd, HWND hwndTab) {
-    if (!hwnd) return;
-    if (g_windowToTab.find(hwnd) == g_windowToTab.end()) {
-        // First time — subclass and register
-        g_windowToTab[hwnd] = hwndTab;
+static void SubclassTargetIfNeeded(HWND hwnd, HWND hwndTab) {
+    if (!hwnd || !IsSubclassTarget(hwnd)) return;
+
+    EnterCriticalSection(&g_cs);
+    bool isNew = g_windowToTab.find(hwnd) == g_windowToTab.end();
+    g_windowToTab[hwnd] = hwndTab; // always update tab association
+    LeaveCriticalSection(&g_cs);
+
+    if (isNew)
         WindhawkUtils::SetWindowSubclassFromAnyThread(hwnd, ExplorerSubclassProc, 0);
-    } else {
-        // Already subclassed — update tab association to current active tab
-        g_windowToTab[hwnd] = hwndTab;
-    }
 }
+
+// ---------------------------------------------------------------------------
+// EnumChildWindows callback — only subclasses target window classes
+// ---------------------------------------------------------------------------
 
 struct EnumChildData { HWND hwndTab; };
 
 static BOOL CALLBACK SubclassChildProc(HWND child, LPARAM lp) {
     auto* data = reinterpret_cast<EnumChildData*>(lp);
-    SubclassIfNew(child, data->hwndTab);
+    SubclassTargetIfNeeded(child, data->hwndTab);
     return TRUE;
 }
 
@@ -250,25 +293,25 @@ HRESULT __thiscall CDefView_UIActivate_hook(void* pThis, UINT uState) {
         pShellView->GetWindow(&hwndView);
         if (!hwndView) return hr;
 
-        // Find this view's ShellTabWindowClass ancestor
         HWND hwndTab = FindTabWindow(hwndView);
 
-        // Find top-level for EnumChildWindows
         HWND hwndTop = hwndView;
         while (GetParent(hwndTop))
             hwndTop = GetParent(hwndTop);
 
-        // Update the stored IShellView for this tab
+        // Update stored IShellView for this tab
         if (hwndTab) {
+            EnterCriticalSection(&g_cs);
             auto it = g_tabShellViews.find(hwndTab);
             if (it != g_tabShellViews.end() && it->second)
                 it->second->Release();
             pShellView->AddRef();
             g_tabShellViews[hwndTab] = pShellView;
+            LeaveCriticalSection(&g_cs);
         }
 
-        // Subclass top-level and all children, tagged with their tab
-        SubclassIfNew(hwndTop, hwndTab);
+        // Subclass only target window classes under hwndTop
+        SubclassTargetIfNeeded(hwndTop, hwndTab);
         EnumChildData data = { hwndTab };
         EnumChildWindows(hwndTop, SubclassChildProc, reinterpret_cast<LPARAM>(&data));
 
@@ -287,6 +330,8 @@ HRESULT __thiscall CDefView_UIActivate_hook(void* pThis, UINT uState) {
 
 BOOL Wh_ModInit() {
     Wh_Log(L"Init");
+
+    InitializeCriticalSection(&g_cs);
 
     HMODULE hShell32 = LoadLibraryW(L"shell32.dll");
     if (!hShell32) {
@@ -310,6 +355,7 @@ BOOL Wh_ModInit() {
 
     if (!WindhawkUtils::HookSymbols(hShell32, shell32DllHooks, ARRAYSIZE(shell32DllHooks))) {
         Wh_Log(L"ERROR: Could not hook CDefView::UIActivate");
+        DeleteCriticalSection(&g_cs);
         return FALSE;
     }
 
@@ -321,6 +367,8 @@ void Wh_ModAfterInit() {}
 
 void Wh_ModUninit() {
     Wh_Log(L"Uninit");
+
+    EnterCriticalSection(&g_cs);
     for (auto& [hwnd, _] : g_windowToTab) {
         KillTimer(hwnd, AUTOFIT_TIMER_ID);
         WindhawkUtils::RemoveWindowSubclassFromAnyThread(hwnd, ExplorerSubclassProc);
@@ -330,6 +378,9 @@ void Wh_ModUninit() {
         if (pSV) pSV->Release();
     }
     g_tabShellViews.clear();
+    LeaveCriticalSection(&g_cs);
+
+    DeleteCriticalSection(&g_cs);
 }
 
 void Wh_ModSettingsChanged() {
