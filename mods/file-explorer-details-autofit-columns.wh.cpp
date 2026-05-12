@@ -368,17 +368,28 @@ void Wh_ModAfterInit() {}
 void Wh_ModUninit() {
     Wh_Log(L"Uninit");
 
+    // Collect handles and release shell views under the lock,
+    // then remove subclasses outside the lock to avoid deadlock
+    std::vector<HWND> windowsToUnsubclass;
+    std::vector<IShellView*> viewsToRelease;
+
     EnterCriticalSection(&g_cs);
     for (auto& [hwnd, _] : g_windowToTab) {
         KillTimer(hwnd, AUTOFIT_TIMER_ID);
-        WindhawkUtils::RemoveWindowSubclassFromAnyThread(hwnd, ExplorerSubclassProc);
+        windowsToUnsubclass.push_back(hwnd);
     }
     g_windowToTab.clear();
     for (auto& [hwnd, pSV] : g_tabShellViews) {
-        if (pSV) pSV->Release();
+        if (pSV) viewsToRelease.push_back(pSV);
     }
     g_tabShellViews.clear();
     LeaveCriticalSection(&g_cs);
+
+    // Safe to call outside the lock
+    for (HWND hwnd : windowsToUnsubclass)
+        WindhawkUtils::RemoveWindowSubclassFromAnyThread(hwnd, ExplorerSubclassProc);
+    for (IShellView* pSV : viewsToRelease)
+        pSV->Release();
 
     DeleteCriticalSection(&g_cs);
 }
