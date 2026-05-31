@@ -54,6 +54,14 @@ static std::vector<std::wstring> g_closedTabStack;
 
 static const size_t MAX_HISTORY = 50;
 
+// Restore thread — OpenAsTab runs here, not inside the keyboard hook
+static HANDLE g_hRestoreThread    = NULL;
+static DWORD  g_dwRestoreThreadId = 0;
+
+// Foreground event hook — enables/disables polling
+static HWINEVENTHOOK g_hForegroundHook = NULL;
+static volatile bool g_bExplorerForeground = false;
+
 // ---------------------------------------------------------------------------
 // COM helper — enumerate all open Explorer tabs.
 // Returns a map of HWND -> current path.
@@ -225,7 +233,8 @@ static bool OpenAsTab(HWND hwndExplorer, const std::wstring& path) {
 }
 
 // ---------------------------------------------------------------------------
-// Reopen one tab from the undo stack
+// Reopen one tab from the undo stack — must NOT be called from inside
+// LowLevelKeyboardProc. Called from the dedicated restore thread instead.
 // ---------------------------------------------------------------------------
 
 static void ReopenLastClosedTab() {
@@ -252,6 +261,31 @@ static void ReopenLastClosedTab() {
 }
 
 // ---------------------------------------------------------------------------
+// Restore thread — processes restore requests posted by the keyboard hook.
+// Runs OpenAsTab (COM + SendMessage + wait loop) safely off the hook.
+// ---------------------------------------------------------------------------
+
+static DWORD WINAPI RestoreThread(LPVOID) {
+    HRESULT hr = CoInitializeEx(nullptr,
+                                COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    if (FAILED(hr)) {
+        return 1;
+    }
+
+    MSG msg;
+    while (g_bRunning && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_APP) {
+            ReopenLastClosedTab();
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    CoUninitialize();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Check whether an Explorer (CabinetWClass) window is in the foreground
 // ---------------------------------------------------------------------------
 
@@ -275,7 +309,9 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             bool shift = (GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0;
             bool alt   = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
             if (ctrl && shift && !alt && IsExplorerWindowForeground()) {
-                ReopenLastClosedTab();
+                if (g_dwRestoreThreadId) {
+                    PostThreadMessageW(g_dwRestoreThreadId, WM_APP, 0, 0);
+                }
                 return 1; // suppress keystroke
             }
         }
@@ -287,28 +323,69 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 // Hook thread
 // ---------------------------------------------------------------------------
 
+static void CALLBACK ForegroundEventProc(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD);
+
 static DWORD WINAPI HookThread(LPVOID) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
     g_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL,
                                         LowLevelKeyboardProc,
                                         GetModuleHandleW(nullptr), 0);
     if (!g_hKeyboardHook) {
+        CoUninitialize();
         return 1;
     }
+
+    // Check if Explorer is already foreground at startup
+    HWND hwndFg = GetForegroundWindow();
+    if (hwndFg) {
+        wchar_t cls[64] = {};
+        GetClassNameW(hwndFg, cls, ARRAYSIZE(cls));
+        g_bExplorerForeground = (lstrcmpW(cls, L"CabinetWClass") == 0);
+    }
+
+    // Install foreground event hook on THIS thread — WINEVENT_OUTOFCONTEXT
+    // requires the installing thread to pump messages, which we do here.
+    g_hForegroundHook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+        nullptr, ForegroundEventProc,
+        0, 0, WINEVENT_OUTOFCONTEXT);
+
     MSG msg;
     while (g_bRunning && GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+
+    if (g_hForegroundHook) {
+        UnhookWinEvent(g_hForegroundHook);
+        g_hForegroundHook = nullptr;
+    }
     if (g_hKeyboardHook) {
         UnhookWindowsHookEx(g_hKeyboardHook);
         g_hKeyboardHook = nullptr;
     }
+    CoUninitialize();
     return 0;
 }
 
 // ---------------------------------------------------------------------------
 // Poll thread — tracks tab opens/closes/navigations
 // ---------------------------------------------------------------------------
+
+// Foreground event callback — sets g_bExplorerForeground so the poll
+// thread only runs when Explorer is the active window.
+static void CALLBACK ForegroundEventProc(HWINEVENTHOOK, DWORD,
+                                         HWND hwnd, LONG, LONG,
+                                         DWORD, DWORD) {
+    if (!hwnd) {
+        g_bExplorerForeground = false;
+        return;
+    }
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, ARRAYSIZE(cls));
+    g_bExplorerForeground = (lstrcmpW(cls, L"CabinetWClass") == 0);
+}
 
 static DWORD WINAPI PollThread(LPVOID) {
     HRESULT hr = CoInitializeEx(nullptr,
@@ -317,16 +394,29 @@ static DWORD WINAPI PollThread(LPVOID) {
         return 1;
     }
 
-    // Seed initial state
+    // Seed initial state. Retry for up to 30s in case the tool process
+    // launched before Explorer's shell windows were ready.
     {
-        std::lock_guard<std::mutex> lk(g_mutex);
-        auto seed = GetCurrentTabs();
-        for (const auto& t : seed) {
-            g_knownTabs[t.hwnd] = t.path;
+        const DWORD deadline = GetTickCount() + 30000;
+        while (g_bRunning && GetTickCount() < deadline) {
+            auto seed = GetCurrentTabs();
+            if (!seed.empty()) {
+                std::lock_guard<std::mutex> lk(g_mutex);
+                for (const auto& t : seed) {
+                    g_knownTabs[t.hwnd] = t.path;
+                }
+                break;
+            }
+            Sleep(1000);
         }
     }
 
     while (g_bRunning) {
+        // Only poll when Explorer is in the foreground — saves CPU otherwise
+        if (!g_bExplorerForeground) {
+            Sleep(150);
+            continue;
+        }
         Sleep(750);
 
         auto currentVec = GetCurrentTabs();
@@ -378,9 +468,15 @@ static DWORD WINAPI PollThread(LPVOID) {
 // ---------------------------------------------------------------------------
 
 BOOL WhTool_ModInit() {
-    Wh_Log(L"Explorer Reopen Closed Tab: initializing...");
+    Wh_Log(L"Explorer Reopen Closed Tab: initialized.");
 
     g_bRunning = true;
+
+    g_hRestoreThread = CreateThread(nullptr, 0, RestoreThread, nullptr, 0,
+                                    &g_dwRestoreThreadId);
+    if (!g_hRestoreThread) {
+        return FALSE;
+    }
 
     g_hPollThread = CreateThread(nullptr, 0, PollThread, nullptr, 0, nullptr);
     if (!g_hPollThread) {
@@ -396,7 +492,6 @@ BOOL WhTool_ModInit() {
 }
 
 void WhTool_ModUninit() {
-
     g_bRunning = false;
 
     if (g_dwHookThreadId) {
@@ -408,12 +503,22 @@ void WhTool_ModUninit() {
         g_hHookThread    = nullptr;
         g_dwHookThreadId = 0;
     }
+
+    if (g_dwRestoreThreadId) {
+        PostThreadMessageW(g_dwRestoreThreadId, WM_QUIT, 0, 0);
+    }
+    if (g_hRestoreThread) {
+        WaitForSingleObject(g_hRestoreThread, 3000);
+        CloseHandle(g_hRestoreThread);
+        g_hRestoreThread    = nullptr;
+        g_dwRestoreThreadId = 0;
+    }
+
     if (g_hPollThread) {
         WaitForSingleObject(g_hPollThread, 3000);
         CloseHandle(g_hPollThread);
         g_hPollThread = nullptr;
     }
-
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -427,11 +532,11 @@ bool g_isToolModProcessLauncher;
 HANDLE g_toolModProcessMutex;
 
 void WINAPI EntryPoint_Hook() {
-    Wh_Log(L">");
     ExitThread(0);
 }
 
 BOOL Wh_ModInit() {
+
     DWORD sessionId;
     if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) &&
         sessionId == 0) {
@@ -444,7 +549,6 @@ BOOL Wh_ModInit() {
     int argc;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLine(), &argc);
     if (!argv) {
-        Wh_Log(L"CommandLineToArgvW failed");
         return FALSE;
     }
 
@@ -477,12 +581,10 @@ BOOL Wh_ModInit() {
         g_toolModProcessMutex =
             CreateMutex(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
         if (!g_toolModProcessMutex) {
-            Wh_Log(L"CreateMutex failed");
             ExitProcess(1);
         }
 
         if (GetLastError() == ERROR_ALREADY_EXISTS) {
-            Wh_Log(L"Tool mod already running (%s)", WH_MOD_ID);
             ExitProcess(1);
         }
 
@@ -520,7 +622,6 @@ void Wh_ModAfterInit() {
                               ARRAYSIZE(currentProcessPath))) {
         case 0:
         case ARRAYSIZE(currentProcessPath):
-            Wh_Log(L"GetModuleFileName failed");
             return;
     }
 
@@ -534,7 +635,6 @@ void Wh_ModAfterInit() {
     if (!kernelModule) {
         kernelModule = GetModuleHandle(L"kernel32.dll");
         if (!kernelModule) {
-            Wh_Log(L"No kernelbase.dll/kernel32.dll");
             return;
         }
     }
@@ -551,7 +651,6 @@ void Wh_ModAfterInit() {
         (CreateProcessInternalW_t)GetProcAddress(kernelModule,
                                                  "CreateProcessInternalW");
     if (!pCreateProcessInternalW) {
-        Wh_Log(L"No CreateProcessInternalW");
         return;
     }
 
@@ -563,7 +662,6 @@ void Wh_ModAfterInit() {
     if (!pCreateProcessInternalW(nullptr, currentProcessPath, commandLine,
                                  nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS,
                                  nullptr, nullptr, &si, &pi, nullptr)) {
-        Wh_Log(L"CreateProcess failed");
         return;
     }
 
